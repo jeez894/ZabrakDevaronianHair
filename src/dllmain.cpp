@@ -39,14 +39,15 @@ namespace
     static_assert(sizeof(FPrimaryAssetId) == 16);
 
     // Same verified Zero Company Steam build as the previous working DLL.
-    constexpr std::uintptr_t kDoesPartMeetRequirementsRva = 0x63C6400;
-    constexpr std::uintptr_t kFilterAssetDataByTagsRva = 0x63D1C20;
-    constexpr std::uintptr_t kGameplayTagContainerCopyCtorRva = 0x40F7B20;
-    constexpr std::uintptr_t kGameplayTagContainerDtorRva = 0x16C2E60;
-    constexpr std::uintptr_t kGameplayTagContainerAddTagRva = 0x41017A0;
+    constexpr std::uintptr_t kDoesPartMeetRequirementsRva = 0x8C46A40; // UCustomizationStatics::DoesPartIdMeetRequirements (1.1 PDB)
+    constexpr std::uintptr_t kFilterAssetDataByTagsRva = 0x8C45550; // UCustomizationStatics::GetCustomizationPartIds (1.1 PDB)
+    constexpr std::uintptr_t kGameplayTagContainerCopyCtorRva = 0x695F040; // FGameplayTagContainer copy ctor (1.1 PDB)
+    constexpr std::uintptr_t kGameplayTagContainerDtorRva = 0x41D8B90; // FGameplayTagContainer dtor (1.1 PDB)
+    constexpr std::uintptr_t kGameplayTagContainerAddTagRva = 0x696A5D0; // FGameplayTagContainer::AddTag (1.1 PDB)
 
-    constexpr std::uint32_t kExpectedPeTimestamp = 0xE10ABE56;
-    constexpr std::uint32_t kExpectedImageSize = 0x0E354000;
+    // 1.1 Shipping image size from the loaded module.  Timestamp is intentionally
+    // not pinned: Steam can rebuild/re-sign without changing the native layout.
+    constexpr std::uint32_t kExpectedImageSize = 0x104AE000;
 
     // Static-manifest architecture: exact CPDs are embedded in the DLL and
     // compatibility is retried only for exact known IDs with their exact tag
@@ -1489,8 +1490,10 @@ namespace
     using DoesPartMeetRequirementsFunction =
         bool(__fastcall*)(const FPrimaryAssetId*, const GameplayTagContainer*);
 
+    // 1.1: FilterAssetDataByTags was removed/inlined. Hook the public
+    // UCustomizationStatics::GetCustomizationPartIds seam instead.
     using FilterAssetDataByTagsFunction =
-        void(__fastcall*)(void*, const GameplayTagContainer*, TArray<FPrimaryAssetId>*);
+        void(__fastcall*)(const GameplayTagContainer*, TArray<FPrimaryAssetId>*);
 
     using GetCustomizationPartDefinitionFromPartIdFunction =
         UObject*(__fastcall*)(const FPrimaryAssetId*);
@@ -1706,7 +1709,6 @@ namespace
         if (nt->Signature != IMAGE_NT_SIGNATURE ||
             nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC ||
             nt->FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64 ||
-            nt->FileHeader.TimeDateStamp != kExpectedPeTimestamp ||
             nt->OptionalHeader.SizeOfImage != kExpectedImageSize)
         {
             reason = "retail-pe-identity-mismatch";
@@ -1716,22 +1718,25 @@ namespace
         const auto image_size =
             static_cast<std::uintptr_t>(nt->OptionalHeader.SizeOfImage);
 
-        // Do NOT validate the first bytes of DoesPartMeetRequirements or
-        // FilterAssetDataByTags here. Another customization mod may already
-        // have installed a compatible absolute detour there. The helper
-        // functions we call directly must still be pristine.
-        if (!bytes_match(base, image_size,
-                         kGameplayTagContainerCopyCtorRva,
-                         kGameplayTagContainerCopyCtorBytes) ||
-            !bytes_match(base, image_size,
-                         kGameplayTagContainerDtorRva,
-                         kGameplayTagContainerDtorBytes) ||
-            !bytes_match(base, image_size,
-                         kGameplayTagContainerAddTagRva,
-                         kGameplayTagContainerAddTagBytes))
+        // 1.1 repair: these RVAs come from the shipped SWZeroCompany.pdb.
+        // The old 16-byte prologues belong to the pre-1.1 binary, so comparing
+        // against them would reject the correct current functions. Keep strict
+        // image bounds here; AOB validation can be added later without blocking
+        // the immediate compatibility repair.
+        constexpr std::array<std::uintptr_t, 5> kRequiredRvas{{
+            kDoesPartMeetRequirementsRva,
+            kFilterAssetDataByTagsRva,
+            kGameplayTagContainerCopyCtorRva,
+            kGameplayTagContainerDtorRva,
+            kGameplayTagContainerAddTagRva,
+        }};
+        for (const auto rva : kRequiredRvas)
         {
-            reason = "helper-byte-mismatch";
-            return false;
+            if (rva == 0 || rva >= image_size)
+            {
+                reason = "required-rva-out-of-range";
+                return false;
+            }
         }
 
         identity = {base, image_size};
@@ -2083,6 +2088,14 @@ namespace
             {
                 return {destination, true};
             }
+        }
+
+        // 1.1 PDB-pinned fallback. The 16-byte arrays above describe the
+        // pre-1.1 prologues, so a direct current function will not match them.
+        // We still require the resolved RVA to point at executable memory.
+        if (is_executable_address(entry))
+        {
+            return {entry, false};
         }
 
         return {};
@@ -2924,7 +2937,6 @@ namespace
     }
 
     auto hook_filter_asset_data_by_tags(
-        void* subsystem,
         const GameplayTagContainer* owned_tags,
         TArray<FPrimaryAssetId>* output) -> void
     {
@@ -2938,7 +2950,7 @@ namespace
         }
 
         // Exactly one chained/vanilla catalogue build.
-        original(subsystem, owned_tags, output);
+        original(owned_tags, output);
 
         if (!owned_tags || !output)
         {
@@ -7292,7 +7304,7 @@ namespace
         ZabrakDevaronianHairMod()
         {
             ModName = STR("ZabrakDevaronianHair");
-            ModVersion = STR("1.0.0-split-hair");
+            ModVersion = STR("1.0.1-game-1.1-pdbfix");
             ModDescription =
                 STR("Zabrak + Devaronian Hair.Hair customization only; exact static lists, no world/component scan");
             ModAuthors = STR("Guillaume Rouge (jeez894)");
